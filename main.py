@@ -1,48 +1,45 @@
 import os
-import asyncio
-from playwright.async_api import async_playwright
+import cloudscraper
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import re
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise Exception("TELEGRAM_BOT_TOKEN not set!")
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 def clean_price(text):
     if not text: return None
-    trans = str.maketrans('۰۱۲۳۴۵۶۷۸۹٬,', '0123456789')
-    cleaned = text.translate(trans).replace(',', '').strip()
-    return int(cleaned) if cleaned.isdigit() else None
+    return int(re.sub(r"[^\d]", "", text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))))
 
-async def search_digikala(query: str):
+def scrape_digikala(query):
+    scraper = cloudscraper.create_scraper()
     url = f"https://www.digikala.com/search/?q={query.replace(' ', '%20')}"
+    html = scraper.get(url).text
+    soup = BeautifulSoup(html, "lxml")
+
     products = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page()
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => false});")
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        for _ in range(12):
-            await page.evaluate("window.scrollBy(0, 1200)")
-            await asyncio.sleep(1.8)
-        cards = await page.locator('a[data-testid="product-card"]').all()
-        for card in cards[:25]:
-            try:
-                title = await card.locator('h3').inner_text(timeout=4000)
-                price = clean_price(await card.locator('[data-testid="price-final"]').inner_text())
-                if not price: continue
-                discount = None
-                if await card.locator('[data-testid="price-discount-percent"]').count() > 0:
-                    discount = await card.locator('[data-testid="price-discount-percent"]').inner_text()
-                old_price = None
-                if await card.locator('[data-testid="price-no-discount"]').count() > 0:
-                    old_price = clean_price(await card.locator('[data-testid="price-no-discount"]').inner_text())
-                href = await card.get_attribute("href")
-                link = "https://www.digikala.com" + href.split("?")[0]
-                img = await card.locator("img").first.get_attribute("src") or "https://www.digikala.com/static/files/logo.svg"
-                products.append({"title": title.strip()[:100], "price": price, "old_price": old_price, "discount": discount, "link": link, "image": img})
-            except: continue
-        await browser.close()
+    for item in soup.select('a[data-testid="product-card"]')[:20]:
+        try:
+            title = item.select_one('h3').get_text(strip=True)
+            price_text = item.select_one('[data-testid="price-final"]')
+            price = clean_price(price_text.get_text()) if price_text else None
+            if not price: continue
+
+            discount = item.select_one('[data-testid="price-discount-percent"]')
+            discount = discount.get_text(strip=True) if discount else None
+
+            link = "https://www.digikala.com" + item['href'].split('?')[0]
+            img = item.select_one('img').get('src', '')
+
+            products.append({
+                "title": title[:100],
+                "price": price,
+                "discount": discount,
+                "link": link,
+                "image": img or "https://www.digikala.com/static/files/logo.svg"
+            })
+        except:
+            continue
     return products
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,35 +47,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
-    await update.message.reply_text(f"در حال جستجو برای «{query}»...")
+    msg = await update.message.reply_text(f"در حال جستجو برای «{query}»...")
+    
     try:
-        products = await search_digikala(query)
+        products = scrape_digikala(query)
         if not products:
-            await update.message.reply_text("محصول پیدا نشد")
+            await msg.edit_text("محصول پیدا نشد")
             return
+
         cheapest = sorted(products, key=lambda x: x["price"])[:3]
         for p in cheapest:
             text = f"{p['title']}\n*قیمت: {p['price']:,} تومان*"
-            if p['discount']: text += f" ← {p['discount']}"
-            keyboard = [[InlineKeyboardButton("خرید", url=p['link'])]]
+            if p['discount']: text += f"  ←  {p['discount']}"
+            keyboard = [[InlineKeyboardButton("خرید از دیجی‌کالا", url=p['link'])]]
             await update.message.reply_photo(p['image'], caption=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text("خطایی رخ داد، دوباره امتحان کن")
+        await msg.delete()
+    except:
+        await msg.edit_text("خطایی پیش آمد، دوباره امتحان کن")
 
-async def main(request):
+def main(event):
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=8080,
-        url_path=TOKEN,
-        webhook_url=f"https://{os.environ['APPWRITE_FUNCTION_ENDPOINT']}/{TOKEN}"
-    )
-    await app.process_update(Update.de_json(request, app.bot))
-    return {"status": "ok"}
+    return app.run_polling()
 
-def handle(event):
-    return asyncio.run(main(event))
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main({}))
