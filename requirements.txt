@@ -1,2 +1,5 @@
 python-telegram-bot==20.8
-playwright==1.41.0
+playwright-stealth
+cloudscraper
+beautifulsoup4
+lxml
